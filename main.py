@@ -8,6 +8,9 @@ import cv2
 import math
 import warnings
 from pathlib import Path
+import lightning as L
+
+from lightning_birdclef import LightningBirdCLEF
 
 import numpy as np
 import pandas as pd
@@ -71,7 +74,7 @@ class CFG:
         human_voices_train = pickle.load(f)
 
     # spectrogram_npy = '/kaggle/input/birdclef-first-5-sec-humanless/birdclef2025_melspec_first_5sec_humanless.npy'
-    spectrogram_npy = kdmitrie_bc25_separation_voice_from_data_path + '/birdclef2025_melspec_first_5sec_humanless_512_window_fmax_14000.npy'
+    spectrogram_npy = viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path + '/versions/1/birdclef2025_melspec_first_5sec_humanless_512_window_fmax_14000.npy'
 
     model_name = 'efficientnet_b0'
     pretrained = True
@@ -456,13 +459,32 @@ class BirdCLEFDatasetFromNPY(Dataset):
             target[self.label_to_idx[label]] = 1.0
         return target
 
-class PseudoLabelDataset(Dataset):
-    def __init__(self, df, cfg, mode="train"):
+class LightningBirdCLEFDataset(L.LightningDataModule):
+    def __init__(self, df, cfg, spectrograms=None, mode="train"):
         self.df = df
         self.cfg = cfg
         self.mode = mode
+
+        # REQUIRE spectrograms to be provided - no disk I/O fallbacks
+        if spectrograms is None:
+            raise ValueError("spectrograms must be provided - this dataset is memory-only")
+        self.spectrograms = spectrograms
+
         taxonomy_df = pd.read_csv(self.cfg.taxonomy_csv)
         self.species_ids = taxonomy_df['primary_label'].tolist()
+        self.num_classes = len(self.species_ids)
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
+
+        # Create samplename mapping
+        if 'samplename' not in self.df.columns:
+            self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+
+        # Filter out samples that don't have spectrograms in memory
+        initial_count = len(self.df)
+        self.df = self.df[self.df['samplename'].isin(self.spectrograms.keys())].reset_index(drop=True)
+        final_count = len(self.df)
+
+        print(f"Memory-only dataset: {final_count}/{initial_count} samples have spectrograms in memory for {mode}")
 
         if cfg.debug:
             self.df = self.df.sample(min(1000, len(self.df)), random_state=cfg.seed).reset_index(drop=True)
@@ -472,17 +494,79 @@ class PseudoLabelDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        target = row[species_ids]
-        spec = process_audio_file(row['filepath'], self.cfg, time_end=df['time_end'])
+        samplename = row['samplename']
+        end_time = row.get('end_time')
+        spec = None
+
+        if not pd.isna(end_time):
+            spec = process_audio_file(row['filepath'], self.cfg, row['end_time'])
+        elif self.spectrograms and samplename in self.spectrograms:
+            spec = self.spectrograms[samplename]
+        elif not self.cfg.LOAD_DATA:
+            spec = process_audio_file(row['filepath'], self.cfg)
+
+        if spec is None:
+            spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
+            if self.mode == "train":  # Only print warning during training
+                print(f"Warning: Spectrogram for {samplename} not found and could not be generated")
+
+        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
 
         if self.mode == "train" and random.random() < self.cfg.aug_prob:
             spec = self.apply_spec_augmentations(spec)
 
+        target = self.encode_label(row['primary_label'])
+
+        if 'secondary_labels' in row and row['secondary_labels'] not in [[''], None, np.nan]:
+            if isinstance(row['secondary_labels'], str):
+                secondary_labels = eval(row['secondary_labels'])
+            else:
+                secondary_labels = row['secondary_labels']
+
+            for label in secondary_labels:
+                if label in self.label_to_idx:
+                    target[self.label_to_idx[label]] = 1.0
+
         return {
             'melspec': spec,
             'target': torch.tensor(target, dtype=torch.float32),
-            'filename': f'soundscape_{row["soundscape_id"]}_{row["time_end"]}',
+            'filename': row['filename']
         }
+
+    def apply_spec_augmentations(self, spec):
+        """Apply augmentations to spectrogram"""
+
+        # Time masking (horizontal stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                width = random.randint(5, 20)
+                start = random.randint(0, spec.shape[2] - width)
+                spec[0, :, start:start+width] = 0
+
+        # Frequency masking (vertical stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                height = random.randint(5, 20)
+                start = random.randint(0, spec.shape[1] - height)
+                spec[0, start:start+height, :] = 0
+
+        # Random brightness/contrast
+        if random.random() < 0.5:
+            gain = random.uniform(0.8, 1.2)
+            bias = random.uniform(-0.1, 0.1)
+            spec = spec * gain + bias
+            spec = torch.clamp(spec, 0, 1)
+
+        return spec
+
+    def encode_label(self, label):
+        """Encode label to one-hot vector"""
+        target = np.zeros(self.num_classes)
+        if label in self.label_to_idx:
+            target[self.label_to_idx[label]] = 1.0
+        return target
 
 def collate_fn(batch):
     """Custom collate function to handle different sized spectrograms"""
@@ -585,6 +669,56 @@ class BirdCLEFModel(nn.Module):
     def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
         """Applies mixup to the loss function"""
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+class LightningBirdClEFModel(L.LightningModule):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        if cfg.criterion == 'BCEWithLogitsLoss':
+            self.criterion = nn.BCEWithLogitsLoss()
+        elif cfg.criterion == 'CrossEntropyLoss':
+            self.criterion = nn.CrossEntropyLoss()
+        self.model = BirdCLEFModel(cfg)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        melspec = batch['melspec']
+        target = batch['target']
+
+        output = self(melspec)
+        loss = self.criterion(output, target)
+
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = get_optimizer(self.model, self.cfg)
+        scheduler = get_scheduler(optimizer, self.cfg)
+
+        # if scheduler is not None:
+        #     if self.cfg.scheduler == 'OneCycleLR':
+        #         return {
+        #             "optimizer": optimizer,
+        #             "lr_scheduler": {
+        #                 "scheduler": scheduler,
+        #                 "interval": "step",
+        #             }
+        #         }
+        #     else:
+        #         return {
+        #             "optimizer": optimizer,
+        #             "lr_scheduler": {
+        #                 "scheduler": scheduler,
+        #                 "interval": "epoch",
+        #             }
+        #         }
+
+        return optimizer
+
+
 
 """## Training Utilities
 We are configuring our optimization strategy with the AdamW optimizer, cosine scheduling, and the BCEWithLogitsLoss criterion.
@@ -790,51 +924,53 @@ def calculate_auc(targets, outputs):
 
 """## Training!"""
 
-def run_training(df, cfg):
-    """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
+def run_training_lightning(cfg, generate_spectrograms=False):
+    """Training function using PyTorch Lightning with K-fold cross validation"""
+    import lightning as L
+    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
+    # Set up data
+    train_df = get_pseudo_train_df()
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-    species_ids = taxonomy_df['primary_label'].tolist()
-    cfg.num_classes = len(species_ids)
+    cfg.num_classes = len(taxonomy_df['primary_label'].tolist())
 
     if cfg.debug:
         cfg.update_debug_settings()
 
-    if cfg.LOAD_DATA:
-        print("Loading pre-computed mel spectrograms from NPY file...")
+    # Load or generate spectrograms
+    spectrograms = None
+    if generate_spectrograms:
+        print("🔄 Generating mel spectrograms from audio files...")
+        spectrograms = generate_spectrograms(train_df, cfg)
+        print(f"✅ Generated {len(spectrograms)} spectrograms")
+    else:
+        print("📂 Loading pre-computed mel spectrograms from NPY file...")
         try:
-            self.spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
-            print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms")
+            spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
+            print(f"✅ Loaded {len(spectrograms)} spectrograms into RAM (~{len(spectrograms) * 256 * 256 * 4 / 1e9:.1f}GB)")
         except Exception as e:
-            print(f"Error loading pre-computed spectrograms: {e}")
-            print("Will generate spectrograms on-the-fly instead.")
-            cfg.LOAD_DATA = False
+            print(f"❌ Failed to load spectrograms: {e}")
+            print("🔄 Falling back to generating spectrograms...")
+            spectrograms = generate_spectrograms(train_df, cfg)
 
-    if not cfg.LOAD_DATA:
-        print("Will generate spectrograms on-the-fly during training.")
-        if 'filepath' not in df.columns:
-            df['filepath'] = cfg.train_datadir + '/' + df.filename
+    print("🚀 Training will be PURE MEMORY-BASED with no disk I/O!")
 
-        if 'samplename' not in df.columns:
-            df['samplename'] = df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
-
+    # Cross-validation
     skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
-
     best_scores = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['primary_label'])):
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['primary_label'])):
         if fold not in cfg.selected_folds:
             continue
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
 
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx].reset_index(drop=True)
+        # Prepare datasets
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
 
-        print(f'Training set: {len(train_df)} samples')
-        print(f'Validation set: {len(val_df)} samples')
-
-        train_dataset = BirdCLEFDatasetFromNPY(train_df, cfg, mode='train')
-        val_dataset = BirdCLEFDatasetFromNPY(val_df, cfg, mode='valid')
+        train_dataset = LightningBirdCLEFDataset(fold_train_df, cfg, spectrograms, mode='train')
+        val_dataset = LightningBirdCLEFDataset(fold_val_df, cfg, spectrograms, mode='valid')
 
         train_loader = DataLoader(
             train_dataset,
@@ -855,106 +991,171 @@ def run_training(df, cfg):
             collate_fn=collate_fn
         )
 
-        model = BirdCLEFModel(cfg).to(cfg.device)
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for training")
-            model = nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[torch.cuda.current_device()],
-                find_unused_parameters=False
-            )
-        # model.to(cfg.device)
-        optimizer = get_optimizer(model, cfg)
-        criterion = get_criterion(cfg)
+        # Initialize Lightning model
+        model = LightningBirdClEFModel(cfg)
 
-        if cfg.scheduler == 'OneCycleLR':
-            scheduler = lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=cfg.lr,
-                steps_per_epoch=len(train_loader),
-                epochs=cfg.epochs,
-                pct_start=0.1
-            )
-        else:
-            scheduler = get_scheduler(optimizer, cfg)
+        # Callbacks
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=f"./checkpoints/fold_{fold}",
+            filename=f"best_model_fold_{fold}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+            verbose=True
+        )
 
-        best_auc = 0
-        best_epoch = 0
+        # Trainer with DDP optimization
+        trainer = L.Trainer(
+            accelerator="gpu",
+            devices=4,  # Use all 4 L4 GPUs
+            strategy="ddp",  # Automatic DDP!
+            max_epochs=cfg.epochs,
+            precision="16-mixed",  # Mixed precision for speed
+            callbacks=[checkpoint_callback],
+            log_every_n_steps=cfg.print_freq,
+            deterministic=True,
+            enable_progress_bar=True,
+            # Optimize for K-fold overhead
+            enable_model_summary=False if fold > 0 else True,
+            logger=False if fold > 0 else True
+        )
 
-        for epoch in range(cfg.epochs):
-            print(f"\nEpoch {epoch+1}/{cfg.epochs}")
+        # Train!
+        print(f"🚀 Training fold {fold} with automatic DDP...")
+        trainer.fit(model, train_loader, val_loader)
 
-            train_loss, train_auc = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                cfg.device,
-                scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
-            )
+        # Get best score
+        best_score = checkpoint_callback.best_model_score.detach()
+        best_scores.append(best_score)
 
-            val_loss, val_auc = validate(model, val_loader, criterion, cfg.device)
+        print(f"✅ Fold {fold} complete! Best score: {best_score:.4f}")
 
-            if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
-                if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_loss)
-                else:
-                    scheduler.step()
-
-            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
-
-            if val_auc > best_auc:
-                best_auc = val_auc
-                best_epoch = epoch + 1
-                print(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
-
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'epoch': epoch,
-                    'val_auc': val_auc,
-                    'train_auc': train_auc,
-                    'cfg': cfg
-                }, f"model_fold{fold}.pth")
-
-        best_scores.append(best_auc)
-        print(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
-
-        # Clear memory
-        del model, optimizer, scheduler, train_loader, val_loader
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Clean up GPU memory between folds
+        # del model, trainer, train_loader, val_loader
+        # torch.cuda.empty_cache()
 
     print("\n" + "="*60)
-    print("Cross-Validation Results:")
-    for fold, score in enumerate(best_scores):
-        print(f"Fold {cfg.selected_folds[fold]}: {score:.4f}")
-    print(f"Mean AUC: {np.mean(best_scores):.4f}")
-    print("="*60)
+    print("📊 K-Fold Cross-Validation Results:")
+    for i, score in enumerate(best_scores):
+        print(f"Fold {cfg.selected_folds[i]}: {score:.4f}")
+    print(f"Mean Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
+    return best_scores
+
 
 if __name__ == "__main__":
-    import time
+    # Set seed for reproducibility
+    import lightning as L
+    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
-    print("\nLoading training data...")
+    cfg = CFG()
+    set_seed(cfg.seed)
+    torch.set_float32_matmul_precision('medium')
+
+    print("Starting Lightning K-Fold Cross-Validation!")
+    print(f"RAM Available: 200GB")
+    print(f"GPUs: 4x L4")
+    print(f"Strategy: Automatic DDP")
+    print(f"Workers: {cfg.num_workers}")
+    print(f"Batch Size: {cfg.batch_size}")
+    print(f"Folds: {len(cfg.selected_folds)} folds")
+
+    # Load data
     train_df = get_pseudo_train_df()
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
+    cfg.num_classes = len(taxonomy_df['primary_label'].tolist())
 
-    print("\nStarting training...")
-    print(f"LOAD_DATA is set to {cfg.LOAD_DATA}")
-    if cfg.LOAD_DATA:
-        print("Using pre-computed mel spectrograms from NPY file")
+    # Option to generate spectrograms or use pre-computed
+    generate_spectrograms_flag = False
+    spectrograms = None
+
+    if generate_spectrograms_flag:
+        print("Will generate spectrograms from audio files")
+        spectrograms = generate_spectrograms(train_df, cfg)
     else:
-        print("Will generate spectrograms on-the-fly during training")
-    run_training(train_df, cfg)
+        print("Loading pre-computed spectrograms...")
+        try:
+            spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
+            print(f"Loaded {len(spectrograms)} spectrograms into RAM")
+        except Exception as e:
+            print(f"Failed to load: {e}. Generating spectrograms...")
+            spectrograms = generate_spectrograms(train_df, cfg)
 
-    print("\nTraining complete!")
+    # K-fold cross-validation
+    skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
+    best_scores = []
 
-# %%
-# df['secondary_labels'] = df['secondary_labels'].astype(str)
-# df['secondary_labels']values
-# (
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['primary_label'])):
+        if fold not in cfg.selected_folds:
+            continue
+
+        print(f'\n{"="*30} Fold {fold} {"="*30}')
+
+        # Prepare datasets
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
+
+        train_dataset = LightningBirdCLEFDataset(fold_train_df, cfg, spectrograms, mode='train')
+        val_dataset = LightningBirdCLEFDataset(fold_val_df, cfg, spectrograms, mode='valid')
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            drop_last=True
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+
+        # Create Lightning model
+        model = LightningBirdClEFModel(cfg)
+
+        # Callbacks
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=f"./checkpoints/fold_{fold}",
+            filename=f"best_model_fold_{fold}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+            verbose=True
+        )
+
+        # Trainer
+        trainer = L.Trainer(
+            accelerator="gpu",
+            devices=4,
+            strategy="ddp",
+            max_epochs=cfg.epochs,
+            precision="16-mixed",
+            callbacks=[checkpoint_callback],
+            enable_progress_bar=True,
+            deterministic=True
+        )
+
+        # Train!
+        print(f"Training fold {fold}...")
+        trainer.fit(model, train_loader, val_loader)
+
+        # Get best score
+        best_score = checkpoint_callback.best_model_score
+        best_scores.append(best_score)
+        print(f"Fold {fold} complete! Best val_loss: {best_score:.4f}")
+
+    print("\n" + "="*60)
+    print("K-Fold Cross-Validation Results:")
+    for i, score in enumerate(best_scores):
+        print(f"Fold {cfg.selected_folds[i]}: {score:.4f}")
+    print(f"Mean val_loss: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
+
 #     df[species_ids]
 #     .apply(lambda col: col >= per_class_thresholds[col.name], axis=0)
 #     .apply(lambda x: x.index[x].values, axis=1)
