@@ -57,7 +57,7 @@ class CFG:
     debug = False
     apex = False
     print_freq = 100
-    num_workers = 4
+    num_workers = 1
 
     OUTPUT_DIR = '/kaggle/working/'
 
@@ -93,8 +93,8 @@ class CFG:
     FMAX = 14000
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 50
-    batch_size = 156
+    epochs = 5
+    batch_size = 32
     criterion = 'BCEWithLogitsLoss'
 
     n_fold = 5
@@ -729,7 +729,6 @@ We are configuring our optimization strategy with the AdamW optimizer, cosine sc
 """
 
 def get_optimizer(model, cfg):
-
     if cfg.optimizer == 'Adam':
         optimizer = optim.Adam(
             model.parameters(),
@@ -751,11 +750,9 @@ def get_optimizer(model, cfg):
         )
     else:
         raise NotImplementedError(f"Optimizer {cfg.optimizer} not implemented")
-
     return optimizer
 
 def get_scheduler(optimizer, cfg):
-
     if cfg.scheduler == 'CosineAnnealingLR':
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -781,7 +778,6 @@ def get_scheduler(optimizer, cfg):
         scheduler = None
     else:
         scheduler = None
-
     return scheduler
 
 def get_criterion(cfg):
@@ -789,127 +785,7 @@ def get_criterion(cfg):
         criterion = nn.BCEWithLogitsLoss()
     else:
         raise NotImplementedError(f"Criterion {cfg.criterion} not implemented")
-
     return criterion
-
-"""## Training Loop"""
-
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
-
-    model.train()
-    losses = []
-    all_targets = []
-    all_outputs = []
-    pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
-
-    for step, batch in pbar:
-
-        if isinstance(batch['melspec'], list):
-            batch_outputs = []
-            batch_losses = []
-
-            for i in range(len(batch['melspec'])):
-                inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                target = batch['target'][i].unsqueeze(0).to(device)
-
-                optimizer.zero_grad()
-                output = model(inputs)
-                loss = criterion(output, target)
-                loss.backward()
-
-                batch_outputs.append(output.detach().cpu())
-                batch_losses.append(loss.item())
-
-            optimizer.step()
-            outputs = torch.cat(batch_outputs, dim=0).numpy()
-            loss = np.mean(batch_losses)
-            targets = batch['target'].numpy()
-
-        else:
-            inputs = batch['melspec'].to(device)
-            targets = batch['target'].to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-
-            if isinstance(outputs, tuple):
-                outputs, loss = outputs
-            else:
-                loss = criterion(outputs, targets)
-
-            loss.backward()
-            optimizer.step()
-
-            outputs = outputs.detach().cpu().numpy()
-            targets = targets.detach().cpu().numpy()
-
-        if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
-            scheduler.step()
-
-        all_outputs.append(outputs)
-        all_targets.append(targets)
-        losses.append(loss if isinstance(loss, float) else loss.item())
-
-        pbar.set_postfix({
-            'train_loss': np.mean(losses[-10:]) if losses else 0,
-            'lr': optimizer.param_groups[0]['lr']
-        })
-
-    all_outputs = np.concatenate(all_outputs)
-    all_targets = np.concatenate(all_targets)
-    auc = calculate_auc(all_targets, all_outputs)
-    avg_loss = np.mean(losses)
-
-    return avg_loss, auc
-
-def validate(model, loader, criterion, device):
-
-    model.eval()
-    losses = []
-    all_targets = []
-    all_outputs = []
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            if isinstance(batch['melspec'], list):
-                batch_outputs = []
-                batch_losses = []
-
-                for i in range(len(batch['melspec'])):
-                    inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                    target = batch['target'][i].unsqueeze(0).to(device)
-
-                    output = model(inputs)
-                    loss = criterion(output, target)
-
-                    batch_outputs.append(output.detach().cpu())
-                    batch_losses.append(loss.item())
-
-                outputs = torch.cat(batch_outputs, dim=0).numpy()
-                loss = np.mean(batch_losses)
-                targets = batch['target'].numpy()
-
-            else:
-                inputs = batch['melspec'].to(device)
-                targets = batch['target'].to(device)
-
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-
-                outputs = outputs.detach().cpu().numpy()
-                targets = targets.detach().cpu().numpy()
-
-            all_outputs.append(outputs)
-            all_targets.append(targets)
-            losses.append(loss if isinstance(loss, float) else loss.item())
-
-    all_outputs = np.concatenate(all_outputs)
-    all_targets = np.concatenate(all_targets)
-
-    auc = calculate_auc(all_targets, all_outputs)
-    avg_loss = np.mean(losses)
-
-    return avg_loss, auc
 
 def calculate_auc(targets, outputs):
 
