@@ -10,8 +10,7 @@ import warnings
 from pathlib import Path
 import lightning as L
 
-from lightning_birdclef import LightningBirdCLEF
-
+from lightning.pytorch import seed_everything
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
@@ -28,6 +27,7 @@ from torch.utils.data import Dataset, DataLoader
 import kagglehub
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torchmetrics.classification.auroc import AUROC
 from tqdm import tqdm
 
 import timm
@@ -57,7 +57,7 @@ class CFG:
     debug = False
     apex = False
     print_freq = 100
-    num_workers = 2
+    num_workers = 4
 
     OUTPUT_DIR = '/kaggle/working/'
 
@@ -93,12 +93,12 @@ class CFG:
     FMAX = 14000
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 5
-    batch_size = 128
+    epochs = 50
+    batch_size = 156
     criterion = 'BCEWithLogitsLoss'
 
     n_fold = 5
-    selected_folds = [0, 1, 2, 3, 4]
+    selected_folds = [0]
 
     optimizer = 'AdamW'
     lr = 5e-4
@@ -198,11 +198,11 @@ def get_per_class_thresholds(df):
         per_class_thresholds[label] = min_thresh + (commonness ** 0.5) * (max_thresh - min_thresh)  # Apply square root
 
     # Sanity check
-    # print("Dynamic threshold example:")
-    # for label in sorted(label_counts, key=label_counts.get)[:5]:  # 5 least frequent
-    #     print(f"{label} (rare): {per_class_thresholds[label]:.3f}")
-    # for label in sorted(label_counts, key=label_counts.get, reverse=True)[:5]:  # 5 most frequent
-    #     print(f"{label} (common): {per_class_thresholds[label]:.3f}")
+    print("Dynamic threshold example:")
+    for label in sorted(label_counts, key=label_counts.get)[:5]:  # 5 least frequent
+        print(f"{label} (rare): {per_class_thresholds[label]:.3f}")
+    for label in sorted(label_counts, key=label_counts.get, reverse=True)[:5]:  # 5 most frequent
+        print(f"{label} (common): {per_class_thresholds[label]:.3f}")
     return per_class_thresholds
 
 
@@ -629,7 +629,6 @@ class BirdCLEFModel(nn.Module):
             self.mixup_alpha = cfg.mixup_alpha
 
     def forward(self, x, targets=None):
-
         if self.training and self.mixup_enabled and targets is not None:
             mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
             x = mixed_x
@@ -673,50 +672,55 @@ class BirdCLEFModel(nn.Module):
 class LightningBirdClEFModel(L.LightningModule):
     def __init__(self, cfg):
         super().__init__()
+        self.automatic_optimization = True
         self.cfg = cfg
-        if cfg.criterion == 'BCEWithLogitsLoss':
-            self.criterion = nn.BCEWithLogitsLoss()
-        elif cfg.criterion == 'CrossEntropyLoss':
-            self.criterion = nn.CrossEntropyLoss()
+        self.criterion = get_criterion(self.cfg)
         self.model = BirdCLEFModel(cfg)
 
-    def forward(self, x):
-        return self.model(x)
+        self.train_auc = AUROC(task='multilabel', num_labels=cfg.num_classes, average="macro")
+        self.val_auc = AUROC(task='multilabel', num_labels=cfg.num_classes, average="macro")
+
+    def forward(self, x, targets=None):
+        return self.model(x, targets)
 
     def training_step(self, batch, batch_idx):
-        melspec = batch['melspec']
-        target = batch['target']
+        inputs = batch['melspec']
+        targets = batch['target']
 
-        output = self(melspec)
-        loss = self.criterion(output, target)
+        outputs = self(inputs)
+        loss = self.criterion(outputs, targets)
 
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        probs = torch.sigmoid(outputs)
+        self.train_auc.update(probs, targets.int())
 
+        self.log('train_loss', loss, prog_bar=True, logger=True)
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        inputs = batch['melspec']
+        targets = batch['target']
+
+        outputs = self.model(inputs, targets)
+        loss = self.criterion(outputs, targets)
+
+        probs = torch.sigmoid(outputs)
+        self.val_auc.update(probs, targets.int())
+
+        self.log('val_loss', loss, prog_bar=True, logger=True)
+        return loss
+
+    def on_training_epoch_end(self):
+        auc = self.train_auc.compute()
+        self.log('train_auc', auc, prog_bar=True, logger=True)
+        self.train_auc.reset()
+
+    def on_validation_epoch_end(self):
+        auc = self.val_auc.compute()
+        self.log('val_auc', auc, prog_bar=True, logger=True)
+        self.val_auc.reset()
+
     def configure_optimizers(self):
-        optimizer = get_optimizer(self.model, self.cfg)
-        scheduler = get_scheduler(optimizer, self.cfg)
-
-        # if scheduler is not None:
-        #     if self.cfg.scheduler == 'OneCycleLR':
-        #         return {
-        #             "optimizer": optimizer,
-        #             "lr_scheduler": {
-        #                 "scheduler": scheduler,
-        #                 "interval": "step",
-        #             }
-        #         }
-        #     else:
-        #         return {
-        #             "optimizer": optimizer,
-        #             "lr_scheduler": {
-        #                 "scheduler": scheduler,
-        #                 "interval": "epoch",
-        #             }
-        #         }
-
-        return optimizer
+        return get_optimizer(self.model, self.cfg)
 
 
 
@@ -781,7 +785,6 @@ def get_scheduler(optimizer, cfg):
     return scheduler
 
 def get_criterion(cfg):
-
     if cfg.criterion == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss()
     else:
@@ -839,6 +842,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
             outputs = outputs.detach().cpu().numpy()
             targets = targets.detach().cpu().numpy()
+
         if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
             scheduler.step()
 
@@ -923,141 +927,20 @@ def calculate_auc(targets, outputs):
     return np.mean(aucs) if aucs else 0.0
 
 """## Training!"""
-
-def run_training_lightning(cfg, generate_spectrograms=False):
-    """Training function using PyTorch Lightning with K-fold cross validation"""
-    import lightning as L
-    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-
-    # Set up data
-    train_df = get_pseudo_train_df()
-    taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-    cfg.num_classes = len(taxonomy_df['primary_label'].tolist())
-
-    if cfg.debug:
-        cfg.update_debug_settings()
-
-    # Load or generate spectrograms
-    spectrograms = None
-    if generate_spectrograms:
-        print("🔄 Generating mel spectrograms from audio files...")
-        spectrograms = generate_spectrograms(train_df, cfg)
-        print(f"✅ Generated {len(spectrograms)} spectrograms")
-    else:
-        print("📂 Loading pre-computed mel spectrograms from NPY file...")
-        try:
-            spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
-            print(f"✅ Loaded {len(spectrograms)} spectrograms into RAM (~{len(spectrograms) * 256 * 256 * 4 / 1e9:.1f}GB)")
-        except Exception as e:
-            print(f"❌ Failed to load spectrograms: {e}")
-            print("🔄 Falling back to generating spectrograms...")
-            spectrograms = generate_spectrograms(train_df, cfg)
-
-    print("🚀 Training will be PURE MEMORY-BASED with no disk I/O!")
-
-    # Cross-validation
-    skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
-    best_scores = []
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['primary_label'])):
-        if fold not in cfg.selected_folds:
-            continue
-
-        print(f'\n{"="*30} Fold {fold} {"="*30}')
-
-        # Prepare datasets
-        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
-        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
-
-        train_dataset = LightningBirdCLEFDataset(fold_train_df, cfg, spectrograms, mode='train')
-        val_dataset = LightningBirdCLEFDataset(fold_val_df, cfg, spectrograms, mode='valid')
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=True
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn
-        )
-
-        # Initialize Lightning model
-        model = LightningBirdClEFModel(cfg)
-
-        # Callbacks
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=f"./checkpoints/fold_{fold}",
-            filename=f"best_model_fold_{fold}",
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-            verbose=True
-        )
-
-        # Trainer with DDP optimization
-        trainer = L.Trainer(
-            accelerator="gpu",
-            devices=4,  # Use all 4 L4 GPUs
-            strategy="ddp",  # Automatic DDP!
-            max_epochs=cfg.epochs,
-            precision="16-mixed",  # Mixed precision for speed
-            callbacks=[checkpoint_callback],
-            log_every_n_steps=cfg.print_freq,
-            deterministic=True,
-            enable_progress_bar=True,
-            # Optimize for K-fold overhead
-            enable_model_summary=False if fold > 0 else True,
-            logger=False if fold > 0 else True
-        )
-
-        # Train!
-        print(f"🚀 Training fold {fold} with automatic DDP...")
-        trainer.fit(model, train_loader, val_loader)
-
-        # Get best score
-        best_score = checkpoint_callback.best_model_score.detach()
-        best_scores.append(best_score)
-
-        print(f"✅ Fold {fold} complete! Best score: {best_score:.4f}")
-
-        # Clean up GPU memory between folds
-        # del model, trainer, train_loader, val_loader
-        # torch.cuda.empty_cache()
-
-    print("\n" + "="*60)
-    print("📊 K-Fold Cross-Validation Results:")
-    for i, score in enumerate(best_scores):
-        print(f"Fold {cfg.selected_folds[i]}: {score:.4f}")
-    print(f"Mean Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
-    return best_scores
-
-
 if __name__ == "__main__":
-    # Set seed for reproducibility
     import lightning as L
     from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
     cfg = CFG()
     set_seed(cfg.seed)
+    seed_everything(cfg.seed)
     torch.set_float32_matmul_precision('medium')
 
     print("Starting Lightning K-Fold Cross-Validation!")
-    print(f"RAM Available: 200GB")
-    print(f"GPUs: 4x L4")
-    print(f"Strategy: Automatic DDP")
     print(f"Workers: {cfg.num_workers}")
     print(f"Batch Size: {cfg.batch_size}")
     print(f"Folds: {len(cfg.selected_folds)} folds")
+
 
     # Load data
     train_df = get_pseudo_train_df()
@@ -1123,19 +1006,14 @@ if __name__ == "__main__":
         checkpoint_callback = ModelCheckpoint(
             dirpath=f"./checkpoints/fold_{fold}",
             filename=f"best_model_fold_{fold}",
-            monitor="val_loss",
-            mode="min",
+            monitor="val_auc",
+            mode="max",
             save_top_k=1,
             verbose=True
         )
 
-        # Trainer
         trainer = L.Trainer(
-            accelerator="gpu",
-            devices=4,
-            strategy="ddp",
             max_epochs=cfg.epochs,
-            precision="16-mixed",
             callbacks=[checkpoint_callback],
             enable_progress_bar=True,
             deterministic=True
@@ -1146,23 +1024,13 @@ if __name__ == "__main__":
         trainer.fit(model, train_loader, val_loader)
 
         # Get best score
-        best_score = checkpoint_callback.best_model_score
-        best_scores.append(best_score)
-        print(f"Fold {fold} complete! Best val_loss: {best_score:.4f}")
+        if checkpoint_callback.best_model_score is not None:
+            best_score = checkpoint_callback.best_model_score.detach().cpu()
+            best_scores.append(best_score)
+            print(f"Fold {fold} complete! Best val_auc: {best_score:.4f}")
 
     print("\n" + "="*60)
     print("K-Fold Cross-Validation Results:")
     for i, score in enumerate(best_scores):
         print(f"Fold {cfg.selected_folds[i]}: {score:.4f}")
-    print(f"Mean val_loss: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
-
-#     df[species_ids]
-#     .apply(lambda col: col >= per_class_thresholds[col.name], axis=0)
-#     .apply(lambda x: x.index[x].values, axis=1)
-#     .astype("string")
-#     .str.replace("[]", "['']")
-# )
-
-# from tqdm import tqdm
-# for i in tqdm(range(1, 10)):
-#     time.sleep(5)
+    print(f"Mean val_auc: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
