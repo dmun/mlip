@@ -1,3 +1,0 @@
-cfg: !!python/object:__main__.CFG
-  LOAD_DATA: false
-  num_classes: 206

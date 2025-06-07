@@ -1,5 +1,5 @@
 data/
-_*/**/*
+_*
 
 # Python-generated files
 __pycache__/
