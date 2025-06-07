@@ -1,3 +1,4 @@
+# %%
 import os
 import logging
 import random
@@ -32,6 +33,9 @@ from tqdm import tqdm
 
 import timm
 
+import pickle
+import pandas as pd
+
 from dotenv import load_dotenv
 
 load_dotenv()  # take environment variables
@@ -40,24 +44,24 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
 # KAGGLE
-# birdclef_2025_path = kagglehub.competition_download('birdclef-2025')
-# viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path = kagglehub.dataset_download('viniciusschmidt/birdclef-first-5-sec-512-window-fmax-14000')
-# kdmitrie_bc25_separation_voice_from_data_path = kagglehub.notebook_output_download('kdmitrie/bc25-separation-voice-from-data')
-# dmunster_bird25_weightedblend_0_88_path = kagglehub.notebook_output_download('dmunster/bird25-weightedblend-0-88')
+birdclef_2025_path = kagglehub.competition_download('birdclef-2025')
+viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path = kagglehub.dataset_download('viniciusschmidt/birdclef-first-5-sec-512-window-fmax-14000')
+kdmitrie_bc25_separation_voice_from_data_path = kagglehub.notebook_output_download('kdmitrie/bc25-separation-voice-from-data')
+dmunster_bird25_weightedblend_0_88_path = kagglehub.notebook_output_download('dmunster/bird25-weightedblend-0-88')
 
-birdclef_2025_path = "./data/kagglehub/competitions/birdclef-2025"
-viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path = "./data/kagglehub/datasets/viniciusschmidt/birdclef-first-5-sec-512-window-fmax-14000"
-kdmitrie_bc25_separation_voice_from_data_path = "./data/kagglehub/notebooks/kdmitrie/bc25-separation-voice-from-data/output/versions/13"
-dmunster_bird25_weightedblend_0_88_path = "./data/kagglehub/notebooks/dmunster/bird25-weightedblend-0-88/output/versions/2"
+# birdclef_2025_path = "./data/kagglehub/competitions/birdclef-2025"
+# viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path = "./data/kagglehub/datasets/viniciusschmidt/birdclef-first-5-sec-512-window-fmax-14000/versions/1"
+# kdmitrie_bc25_separation_voice_from_data_path = "./data/kagglehub/notebooks/kdmitrie/bc25-separation-voice-from-data/output/versions/13"
+# dmunster_bird25_weightedblend_0_88_path = "./data/kagglehub/notebooks/dmunster/bird25-weightedblend-0-88/output/versions/2"
 
 """## Configuration"""
-
+# %%
 class CFG:
     seed = 42
     debug = False
     apex = False
     print_freq = 100
-    num_workers = 1
+    num_workers = 36
 
     OUTPUT_DIR = '/kaggle/working/'
 
@@ -74,7 +78,8 @@ class CFG:
         human_voices_train = pickle.load(f)
 
     # spectrogram_npy = '/kaggle/input/birdclef-first-5-sec-humanless/birdclef2025_melspec_first_5sec_humanless.npy'
-    spectrogram_npy = viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path + '/versions/1/birdclef2025_melspec_first_5sec_humanless_512_window_fmax_14000.npy'
+    spectrogram_npy = viniciusschmidt_birdclef_first_5_sec_512_window_fmax_14000_path + 'birdclef2025_melspec_first_5sec_humanless_512_window_fmax_14000.npy'
+    pseudo_spectrogram_npy = './data/train_soundscapes_melspec_first_5sec.npy'
 
     model_name = 'efficientnet_b0'
     pretrained = True
@@ -85,20 +90,20 @@ class CFG:
     TARGET_DURATION = 5.0
     TARGET_SHAPE = (256, 256)
 
-    N_FFT = 512
-    HOP_LENGTH = 128
-    N_MELS = 64
+    N_FFT = 1024
+    HOP_LENGTH = 512
+    N_MELS = 128
     N_MFCC = 128
     FMIN = 50
     FMAX = 14000
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 5
-    batch_size = 32
+    batch_size = 64
     criterion = 'BCEWithLogitsLoss'
 
     n_fold = 5
-    selected_folds = [0]
+    selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
     lr = 5e-4
@@ -117,11 +122,8 @@ class CFG:
             self.selected_folds = [0]
 
 cfg = CFG()
-
-print(f"Using {cfg.device}")
-
+# %%
 """## Utilities"""
-
 def set_seed(seed=42):
     """
     Set seed for reproducibility
@@ -133,15 +135,14 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
 
 set_seed(cfg.seed)
 
-import pickle
-import pandas as pd
-
 def get_pseudo_train_df():
     train_df = pd.read_csv(cfg.train_csv)
+    train_df['samplename'] = train_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+
     per_class_thresholds = get_per_class_thresholds(train_df)
 
     nfnet_df = pd.DataFrame(pd.read_pickle(cfg.nfnet_pred_path))
@@ -161,14 +162,16 @@ def get_pseudo_train_df():
             weights=weights,
             axis=0
         )
+        # df.drop([f'{col}_x', f'{col}_y'], axis=1, inplace=True)
 
     df[['filename', 'end_time']] = df['row_id'].str.rsplit('_', n=1, expand=True)
     df['end_time'] = df['end_time'].astype(int)
-    df = df.groupby('filename').sample(1).reset_index(drop=True)
+
+    df['samplename'] = df['filename']
+    df = df.drop_duplicates('filename').reset_index(drop=True)
 
     df['filepath'] = df['filename'].apply(lambda sid: f'{cfg.train_soundscapes}/{sid}.ogg')
     df['primary_label'] = df[species_ids].idxmax(axis=1)
-
 
     df['secondary_labels'] = (
         df[species_ids]
@@ -319,35 +322,6 @@ def generate_spectrograms(df, cfg):
 """## Dataset Preparation and Data Augmentations
 We'll convert audio to mel spectrograms and apply random augmentations with 50% probability each - including time stretching, pitch shifting, and volume adjustments. This randomized approach creates diverse training samples from the same audio files
 """
-
-def apply_spec_augmentations(spec):
-    """Apply augmentations to spectrogram"""
-
-    # Time masking (horizontal stripes)
-    if random.random() < 0.5:
-        num_masks = random.randint(1, 3)
-        for _ in range(num_masks):
-            width = random.randint(5, 20)
-            start = random.randint(0, spec.shape[2] - width)
-            spec[0, :, start:start+width] = 0
-
-    # Frequency masking (vertical stripes)
-    if random.random() < 0.5:
-        num_masks = random.randint(1, 3)
-        for _ in range(num_masks):
-            height = random.randint(5, 20)
-            start = random.randint(0, spec.shape[1] - height)
-            spec[0, start:start+height, :] = 0
-
-    # Random brightness/contrast
-    if random.random() < 0.5:
-        gain = random.uniform(0.8, 1.2)
-        bias = random.uniform(-0.1, 0.1)
-        spec = spec * gain + bias
-        spec = torch.clamp(spec, 0, 1)
-
-    return spec
-
 class BirdCLEFDatasetFromNPY(Dataset):
     def __init__(self, df, cfg, spectrograms=None, mode="train"):
         self.df = df
@@ -389,9 +363,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
         end_time = row.get('end_time')
         spec = None
 
-        if not pd.isna(end_time):
-            spec = process_audio_file(row['filepath'], self.cfg, row['end_time'])
-        elif self.spectrograms and samplename in self.spectrograms:
+        if self.spectrograms and samplename in self.spectrograms.keys():
             spec = self.spectrograms[samplename]
         elif not self.cfg.LOAD_DATA:
             spec = process_audio_file(row['filepath'], self.cfg)
@@ -498,12 +470,10 @@ class LightningBirdCLEFDataset(L.LightningDataModule):
         end_time = row.get('end_time')
         spec = None
 
-        if not pd.isna(end_time):
-            spec = process_audio_file(row['filepath'], self.cfg, row['end_time'])
-        elif self.spectrograms and samplename in self.spectrograms:
-            spec = self.spectrograms[samplename]
-        elif not self.cfg.LOAD_DATA:
-            spec = process_audio_file(row['filepath'], self.cfg)
+        # if self.spectrograms and samplename in self.spectrograms.keys():
+        spec = self.spectrograms[samplename]
+        # elif not self.cfg.LOAD_DATA:
+            # spec = process_audio_file(row['filepath'], self.cfg)
 
         if spec is None:
             spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
@@ -656,13 +626,9 @@ class BirdCLEFModel(nn.Module):
     def mixup_data(self, x, targets):
         """Applies mixup to the data batch"""
         batch_size = x.size(0)
-
         lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-
         indices = torch.randperm(batch_size).to(x.device)
-
         mixed_x = lam * x + (1 - lam) * x[indices]
-
         return mixed_x, targets, targets[indices], lam
 
     def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
@@ -677,8 +643,8 @@ class LightningBirdClEFModel(L.LightningModule):
         self.criterion = get_criterion(self.cfg)
         self.model = BirdCLEFModel(cfg)
 
-        self.train_auc = AUROC(task='multilabel', num_labels=cfg.num_classes, average="macro")
-        self.val_auc = AUROC(task='multilabel', num_labels=cfg.num_classes, average="macro")
+        self.train_auc = AUROC(task='multilabel', num_labels=cfg.num_classes)
+        self.val_auc = AUROC(task='multilabel', num_labels=cfg.num_classes)
 
     def forward(self, x, targets=None):
         return self.model(x, targets)
@@ -720,13 +686,14 @@ class LightningBirdClEFModel(L.LightningModule):
         self.val_auc.reset()
 
     def configure_optimizers(self):
-        return get_optimizer(self.model, self.cfg)
+        optimizer = get_optimizer(self.model, self.cfg)
+        scheduler = get_scheduler(optimizer, self.cfg)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler,
+        }
 
 
-
-"""## Training Utilities
-We are configuring our optimization strategy with the AdamW optimizer, cosine scheduling, and the BCEWithLogitsLoss criterion.
-"""
 
 def get_optimizer(model, cfg):
     if cfg.optimizer == 'Adam':
@@ -788,19 +755,15 @@ def get_criterion(cfg):
     return criterion
 
 def calculate_auc(targets, outputs):
-
     num_classes = targets.shape[1]
     aucs = []
-
     probs = 1 / (1 + np.exp(-outputs))
-
     for i in range(num_classes):
-
         if np.sum(targets[:, i]) > 0:
             class_auc = roc_auc_score(targets[:, i], probs[:, i])
             aucs.append(class_auc)
-
     return np.mean(aucs) if aucs else 0.0
+
 
 """## Training!"""
 if __name__ == "__main__":
@@ -817,13 +780,10 @@ if __name__ == "__main__":
     print(f"Batch Size: {cfg.batch_size}")
     print(f"Folds: {len(cfg.selected_folds)} folds")
 
-
-    # Load data
     train_df = get_pseudo_train_df()
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
     cfg.num_classes = len(taxonomy_df['primary_label'].tolist())
 
-    # Option to generate spectrograms or use pre-computed
     generate_spectrograms_flag = False
     spectrograms = None
 
@@ -834,6 +794,7 @@ if __name__ == "__main__":
         print("Loading pre-computed spectrograms...")
         try:
             spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
+            spectrograms.update(np.load(cfg.pseudo_spectrogram_npy, allow_pickle=True).item())
             print(f"Loaded {len(spectrograms)} spectrograms into RAM")
         except Exception as e:
             print(f"Failed to load: {e}. Generating spectrograms...")
@@ -880,7 +841,7 @@ if __name__ == "__main__":
 
         # Callbacks
         checkpoint_callback = ModelCheckpoint(
-            dirpath=f"./checkpoints/fold_{fold}",
+            dirpath=f"./checkpoinfts/fold_{fold}",
             filename=f"best_model_fold_{fold}",
             monitor="val_auc",
             mode="max",
@@ -892,7 +853,8 @@ if __name__ == "__main__":
             max_epochs=cfg.epochs,
             callbacks=[checkpoint_callback],
             enable_progress_bar=True,
-            deterministic=True
+            deterministic=True,
+            benchmark=True,
         )
 
         # Train!
